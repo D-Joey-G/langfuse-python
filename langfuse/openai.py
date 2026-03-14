@@ -199,17 +199,31 @@ class OpenAiArgsExtractor:
         **kwargs: Any,
     ) -> None:
         self.args = {}
-        self.args["metadata"] = (
-            metadata
-            if "response_format" not in kwargs
-            else {
-                **(metadata or {}),
-                "response_format": kwargs["response_format"].model_json_schema()
-                if isclass(kwargs["response_format"])
-                and issubclass(kwargs["response_format"], BaseModel)
-                else kwargs["response_format"],
-            }
-        )
+        self.synthetic_metadata_keys = set()
+
+        langfuse_metadata = metadata
+        metadata_from_openai_args = {}
+
+        if "response_format" in kwargs and not isinstance(
+            kwargs.get("response_format", None), NotGiven
+        ):
+            metadata_from_openai_args["response_format"] = (
+                _serialize_structured_output_format(kwargs["response_format"])
+            )
+
+        if "text_format" in kwargs and not isinstance(
+            kwargs.get("text_format", None), NotGiven
+        ):
+            metadata_from_openai_args["text_format"] = (
+                _serialize_structured_output_format(kwargs["text_format"])
+            )
+
+        if metadata_from_openai_args:
+            existing_metadata = _normalize_metadata(metadata)
+            langfuse_metadata = {**existing_metadata, **metadata_from_openai_args}
+            self.synthetic_metadata_keys = set(metadata_from_openai_args)
+
+        self.args["metadata"] = langfuse_metadata
         self.args["name"] = name
         self.args["langfuse_public_key"] = langfuse_public_key
         self.args["langfuse_prompt"] = langfuse_prompt
@@ -225,15 +239,36 @@ class OpenAiArgsExtractor:
         # If OpenAI model distillation is enabled, we need to add the metadata to the kwargs
         # https://platform.openai.com/docs/guides/distillation
         if self.kwargs.get("store", False):
-            self.kwargs["metadata"] = (
-                {} if self.args.get("metadata", None) is None else self.args["metadata"]
+            self.kwargs["metadata"] = _normalize_metadata(
+                self.args.get("metadata", None)
             )
 
             # OpenAI does not support non-string type values in metadata when using
             # model distillation feature
-            self.kwargs["metadata"].pop("response_format", None)
+            for key in self.synthetic_metadata_keys:
+                self.kwargs["metadata"].pop(key, None)
 
         return self.kwargs
+
+
+def _normalize_metadata(metadata: Any) -> dict[str, Any]:
+    if metadata is None or isinstance(metadata, NotGiven):
+        return {}
+
+    if isinstance(metadata, dict):
+        return dict(metadata)
+
+    if isinstance(metadata, BaseModel):
+        return metadata.model_dump()
+
+    return {}
+
+
+def _serialize_structured_output_format(value: Any) -> Any:
+    if isclass(value) and issubclass(value, BaseModel):
+        return value.model_json_schema()
+
+    return value
 
 
 def _langfuse_wrapper(func: Any) -> Any:
@@ -413,16 +448,7 @@ def _get_langfuse_data_from_kwargs(resource: OpenAiDefinition, kwargs: Any) -> A
     if parent_observation_id is not None and trace_id is None:
         raise ValueError("parent_observation_id requires trace_id to be set")
 
-    metadata = kwargs.get("metadata", {})
-    if (
-        metadata is not None
-        and not isinstance(metadata, NotGiven)
-        and not isinstance(metadata, dict)
-    ):
-        if isinstance(metadata, BaseModel):
-            metadata = metadata.model_dump()
-        else:
-            metadata = {}
+    metadata = _normalize_metadata(kwargs.get("metadata", {}))
 
     model = kwargs.get("model", None) or None
 
